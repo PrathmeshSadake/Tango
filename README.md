@@ -255,23 +255,3 @@ Caddy obtains a Let's Encrypt certificate automatically on the first request.
 ```bash
 git pull && docker compose up -d --build
 ```
-
-**Backups:** schedule a nightly `mysqldump` and an `mc mirror` of the RustFS bucket to off-server storage, and enable EBS snapshots.
-
-The RustFS console is bound to `127.0.0.1:9001`. Reach it over an SSH tunnel:
-
-```bash
-ssh -L 9001:localhost:9001 ubuntu@<server-ip>
-```
-
-## Roadmap
-
-- [ ] Real-time seat updates with Server-Sent Events
-- [ ] Email tickets with PDF attachments
-- [ ] Coupons and discounts
-- [ ] "Tango Pass" subscription with fee-free bookings
-- [ ] Food and beverage add-ons
-
-## License
-
-MIT
