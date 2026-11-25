@@ -2,7 +2,7 @@
 
 A BookMyShow-style movie ticket booking app. Pick a city, browse and search movies by date, choose a showtime, select your seats, and they are held for **7 minutes** while you pay. Nobody else can book them in that window.
 
-Built with React, Go, MySQL, Redis and RustFS, with Clerk for auth and Dodo Payments for checkout. The whole stack starts with one `docker compose up`.
+Built with a Go API gateway, Go microservices, React, MySQL, Redis and RustFS, with Clerk for auth and Dodo Payments for checkout. The whole stack starts with one `docker compose up`.
 
 ---
 
@@ -23,73 +23,121 @@ Built with React, Go, MySQL, Redis and RustFS, with Clerk for auth and Dodo Paym
 
 ```mermaid
 flowchart TB
-    browser["User browser<br/><small>Clerk sign-in, seat picker</small>"]
-    clerk["Clerk<br/><small>Sign-in, sessions, JWTs</small>"]:::ext
-    dodo["Dodo Payments<br/><small>Hosted checkout, webhooks</small>"]:::ext
+    browser["Browser<br/>React app"]
+    clerk["Clerk<br/>sign-in, JWTs"]:::ext
+    dodo["Dodo Payments<br/>checkout, webhooks"]:::ext
 
-    subgraph compose["docker compose up on EC2"]
-        caddy["Caddy<br/><small>HTTPS via Let's Encrypt<br/>routes / and /api and /media</small>"]
-        web["web<br/><small>React + Vite, built with Bun<br/>served by Nginx</small>"]
-        api["api (Go)<br/><small>REST, seat holds, checkout<br/>Dodo webhooks, sweeper</small>"]:::main
-        rustfs["rustfs (S3)<br/><small>Posters and banners<br/>public reads at /media</small>"]
-        mysql[("mysql<br/><small>Source of truth<br/>UNIQUE (show_id, seat_id)</small>")]
-        redis[("redis<br/><small>Seat holds, TTL 7 min<br/>Rate limits</small>")]
+    subgraph host["One server: docker compose up"]
+        caddy["Caddy<br/>HTTPS, static files, /media"]
+        web["web<br/>React build on Nginx"]
+        gw["API gateway (Go)<br/>auth, rate limits, routing"]:::main
+
+        subgraph svcs["Go services"]
+            catalog["catalog<br/>cities, theaters, movies, shows"]
+            booking["booking<br/>seat holds, bookings"]
+            payment["payment<br/>checkout, webhooks, refunds"]
+            notify["notification<br/>emails"]
+        end
+
+        mysql[("MySQL<br/>one database per service")]
+        redis[("Redis<br/>holds, rate limits, event streams")]
+        rustfs[("RustFS<br/>posters")]
     end
 
     browser -- sign in --> clerk
     browser -- HTTPS --> caddy
-    caddy -- "/" --> web
-    caddy -- "/api" --> api
-    caddy -- "/media" --> rustfs
-    api -- verify JWT --> clerk
-    api <-- "checkout, webhook" --> dodo
-    api --> mysql
-    api --> redis
-    api -- presigned uploads --> rustfs
+    caddy --> web
+    caddy -- "/api/*" --> gw
+    caddy -- "/media/*" --> rustfs
+    gw -- verify JWT --> clerk
+    gw -- REST --> catalog
+    gw -- REST --> booking
+    gw -- REST --> payment
+    booking -- gRPC --> catalog
+    payment -- gRPC --> booking
+    payment <-- "checkout, webhooks" --> dodo
+    catalog --> mysql
+    booking --> mysql
+    payment --> mysql
+    notify --> mysql
+    booking --> redis
+    payment -. events .-> redis
+    redis -. events .-> booking
+    redis -. events .-> notify
+    catalog --> rustfs
 
     classDef ext stroke-dasharray: 5 5
     classDef main stroke-width:3px
 ```
 
-Only ports 80 and 443 are public, and both go to Caddy. The Go API is the only service that talks to MySQL, Redis, RustFS, Clerk and Dodo. The browser talks only to Caddy, Clerk's sign-in widget and Dodo's hosted checkout page. Dashed boxes are external SaaS. Named Docker volumes keep MySQL, Redis and RustFS data across restarts.
+Only ports 80 and 443 are public, and both go to Caddy. The browser talks to Caddy, Clerk's sign-in widget and Dodo's hosted checkout. The gateway is the only public API; catalog, booking, payment and notification stay on the internal network. Dashed boxes are external SaaS.
+
+| Component | Owns | Talks to |
+| --- | --- | --- |
+| **Caddy** | HTTPS certificates, serving the React build and posters | gateway, web, RustFS |
+| **API gateway** | The public API surface: authentication, rate limiting, routing | catalog, booking, payment (HTTP) |
+| **catalog** | Cities, theaters, screens, seat layouts, movies, shows, prices, posters | MySQL `catalog` DB, RustFS |
+| **booking** | Seat holds, bookings, the seat map, confirming seats | MySQL `booking` DB, Redis, catalog (gRPC), events |
+| **payment** | Checkout sessions, Dodo webhooks, refunds | MySQL `payment` DB, Dodo, booking (gRPC), events |
+| **notification** | Confirmation and refund emails | MySQL `notification` DB, events, email provider |
+
+### Three rules that shape everything
+
+1. **Each service owns its data.** Only the booking service reads or writes the `booking` database. Others ask booking (gRPC) or listen to its events. This is what lets services change and deploy independently.
+2. **Synchronous calls only when you need an answer now; events for everything else.** "What does this show cost?" needs an answer now (gRPC). "A payment succeeded" is a fact others react to in their own time (an event).
+3. **Assume everything fails and everything happens twice.** Networks drop, webhooks retry, containers restart. Every handler is idempotent (safe to run twice) and every external call has a timeout.
+
+### Why microservices
+
+For a small team, a well-structured monolith is usually the right first step. Tango uses microservices because:
+
+- **Different load profiles.** On a blockbuster release, seat holds spike 100× while the catalog barely changes. Booking can scale on its own.
+- **Different failure blast radius.** If the email provider is down, bookings must still work. A separate notification service that consumes events makes that automatic.
+- **Different security sensitivity.** Only the payment service holds payment API keys.
+- **The patterns.** Gateway, service-to-service auth, outbox, sagas and idempotent consumers are what larger systems run in production.
+
+The services sit in **one repository** (a monorepo) and **one Go module**, but each builds into its own Docker image and runs as its own process.
 
 ### Booking flow
 
 ```mermaid
 sequenceDiagram
     actor U as User
-    participant W as React app
-    participant A as Go API
+    participant G as Gateway
+    participant B as Booking
+    participant C as Catalog
     participant R as Redis
-    participant M as MySQL
-    participant D as Dodo Payments
+    participant P as Payment
+    participant D as Dodo
+    participant N as Notification
 
-    U->>W: Select seats, click Proceed
-    W->>A: POST /api/shows/{id}/holds
-    A->>M: Check seats not already booked
-    A->>R: Lua script: hold all seats (EX 420) or none
-    A->>M: Insert PENDING booking
-    A-->>W: bookingId, expiresAt (7:00 countdown)
-    U->>W: Click Pay
-    W->>A: POST /api/bookings/{id}/checkout
-    A->>D: Create checkout session (amount, booking_id)
-    A-->>W: checkout_url
-    W->>D: Redirect, user pays
-    D->>A: Webhook payment.succeeded
-    A->>M: Insert booking_seats, mark CONFIRMED
-    A->>R: Release holds
-    D-->>W: Redirect to status page
-    W->>A: Poll GET /api/bookings/{id}
-    A-->>W: CONFIRMED, ticket
-    Note over R: No payment in 7 min, so the keys expire and seats free up
+    U->>G: POST /api/v1/shows/42/holds {seats}
+    G->>G: verify Clerk JWT, rate limit
+    G->>B: forward + X-User-Id
+    B->>C: gRPC GetShow(42) (seats, prices)
+    B->>R: Lua: hold all seats for 7 min, or none
+    B-->>U: booking PENDING, expiresAt
+    U->>G: POST /api/v1/payments/checkout {booking_id}
+    G->>P: forward
+    P->>B: gRPC GetBookingForCheckout
+    P->>D: create checkout session
+    P-->>U: checkout_url
+    U->>D: pays
+    D->>G: webhook payment.succeeded
+    G->>P: forward (public route)
+    P->>P: verify signature, save + outbox (one transaction)
+    P--)R: event payment.succeeded
+    R--)B: consume
+    B->>B: insert booking_seats (unique per seat), CONFIRMED + outbox
+    B--)R: event booking.confirmed
+    R--)N: consume
+    N->>U: confirmation email
+    U->>G: GET /api/v1/bookings/{id} (polling)
+    G->>B: forward
+    B-->>U: CONFIRMED + ticket
 ```
 
-### How the seat hold works
-
-- Each held seat is a Redis key `hold:{showId}:{seatId}` holding the booking id, with a 420-second TTL.
-- A Lua script checks and sets every requested seat in one atomic step, so two users can never hold the same seat.
-- When the TTL expires, Redis deletes the keys and the seats become available again. No cron job is needed.
-- The webhook, not the browser redirect, confirms a booking. Confirmation inserts rows into `booking_seats`, which has `UNIQUE (show_id, seat_id)`. If a late payment hits a seat someone else already took, the insert fails and the payment is refunded.
+Each held seat is a Redis key with a 420-second TTL, set by a Lua script that claims every requested seat or none of them. When the TTL expires, Redis deletes the keys and the seats free up. Confirmation inserts rows into `booking_seats`, which has `UNIQUE (show_id, seat_id)`. If a late payment hits a seat someone else already took, the insert fails and payment refunds.
 
 ## Tech stack
 
